@@ -2,21 +2,32 @@
 
 This repository contains the original `module_space` AdaLN-offset implementation, the reference images under `contents/`, and the style references under `styles/`. Model checkpoints are intentionally not stored in GitHub; download them into `weights/` on the GPU machine.
 
-## 1. Create the Vast.ai machine
+## Use the friend-synchronized branch
 
-Use a CUDA-enabled Ubuntu image with at least 32 GB of VRAM for the 1M / 1024px experiment. Open a terminal in the repository after connecting:
+This branch contains the friend-synchronized code, the project data, and the
+Vast.ai setup scripts. If the repository is not on the server yet:
+
+```bash
+cd /workspace
+git clone -b friend_module_space_sync https://github.com/LeeHoang2710/Modulation-Edit.git
+cd Modulation-Edit
+```
+
+If the repository is already there, update it without overwriting local work:
 
 ```bash
 cd /workspace/Modulation-Edit
-git switch module_space
+git fetch origin
+git switch friend_module_space_sync
+git pull --ff-only origin friend_module_space_sync
 ```
 
-If the repository is not present yet:
+## 1. Create the Vast.ai machine
 
-```bash
-git clone -b module_space https://github.com/LeeHoang2710/Modulation-Edit.git
-cd Modulation-Edit
-```
+Use a CUDA-enabled Ubuntu image with a high-VRAM GPU. The 1M experiment below
+uses a **five-image micro-batch**, which can require substantially more VRAM
+than the earlier batch-size-2 run. It has not yet been measured on the new
+machine; 32–40 GB is not guaranteed to be sufficient.
 
 ## 2. Install Miniconda
 
@@ -84,89 +95,77 @@ styles/2.png
 
 To use another subject, place its images in a new folder under `contents/`. The original optimizer accepts JPG, JPEG, PNG, WebP, and BMP files.
 
-## 6. Run the original AdaLN-offset experiment
+## 6. Run the dog scale-range experiment
 
-The prepared launcher uses the original friend implementation with the current experiment settings:
-
-- one image per optimizer step;
-- gradient accumulation of 1;
-- 400 optimizer steps by default;
-- per-scale AdaLN offsets;
-- horizontal-flip augmentation;
-- cached VAE features and Bitwise Self-Correction;
-- null-text (`cfg_uncond`) conditioning.
-
-Run it with:
+With the conda environment activated, run from the repository root:
 
 ```bash
-bash scripts/run_contents_offset.sh dog
+cd /workspace/Modulation-Edit
+conda activate infinity-modulation
+bash scripts/run_dog_prompt_modulation_experiment.sh
 ```
 
-For the hybrid experiment—learn the first four scales with null conditioning,
-then use a text prompt for later scales—run:
+The script reads `contents/dog` (or `data/dreambooth/dataset/dog` if the first
+folder is absent). It runs **four independent optimizations** on scales
+`0-3`, `0-4`, `0-5`, and `0-6`. Each run uses the same seed, 50 optimizer
+steps, `batch_size=5`, `grad_accum=1`, BF16, and horizontal flips. With five
+original dog images, the batch contains five randomly selected examples from
+the originals **and their flips**; it is not guaranteed to contain each
+original image once at every step. The loss and learned offset are restricted
+to that run's scale range.
 
-```bash
-bash scripts/run_hybrid_contents_offset.sh dog
-```
+After each optimization, inference keeps `cfg_uncond` as the base condition,
+adds the learned offset only on its trained scales, and injects the new prompt
+through cross-attention **and** `alpha * (G_prompt - G_null)` on every scale.
+The five default prompts contain no word "dog": sleeping on a bed, running
+through snow, wearing a red hat, seen from behind on a beach, and jumping over
+a fallen log. For each scale range it tests alpha `0,0.25,0.5,1`, CFG `1,1.5`,
+and seeds `0..4`: **200 generated images per range, 800 total**. CFG `1` uses
+only the conditional row; CFG `1.5` also evaluates the null cross-attention
+row with the same subject offset.
 
-The default hybrid settings are:
+Results are stored separately:
 
 ```text
-learned scales: 0-3
-text-conditioned scales: 4-12
-later prompt: "is sleeping"
-CFG after the switch: 3
+output/ada_offset/dog_prompt_modulation_50steps_bs5/
+├── scales_0-3/
+│   ├── offset.pth
+│   ├── optimize.log
+│   ├── optimization_reconstruction.jpg
+│   └── inference/dog/<prompt>/grid.jpg
+├── scales_0-4/
+├── scales_0-5/
+└── scales_0-6/
 ```
 
-You can change the prompt or boundary:
+Individual generated images and `infer.log` are also saved under each
+`inference/` directory. For a quick single-range test before launching all
+four runs:
 
 ```bash
-HYBRID_PROMPT="is sleeping on a beach" \\
-HYBRID_START_SCALE=4 \\
-bash scripts/run_hybrid_contents_offset.sh dog
+SCALE_ENDS=4 bash scripts/run_dog_prompt_modulation_experiment.sh
 ```
 
-For another subject:
+To change the data or output location:
 
 ```bash
-bash scripts/run_contents_offset.sh cat
+IMAGES_DIR=contents/dog EXPERIMENT_DIR=output/my_dog_test \
+  bash scripts/run_dog_prompt_modulation_experiment.sh
 ```
 
-The result is saved under:
-
-```text
-output/ada_offset/<subject>_lsall/
-├── offset.pth
-├── optimize.log
-├── samples_vs_targets.jpg
-└── samples_vs_targets_r0_*.jpg
-```
-
-## 7. Change experiment settings
-
-The launcher accepts environment-variable overrides:
+The script refuses to overwrite an existing offset. To repeat an experiment,
+choose a new `EXPERIMENT_DIR`. If a run stops after saving its offset, rerun
+inference only, for example:
 
 ```bash
-ITERS=800 LR=1e-2 PN=0.25M bash scripts/run_contents_offset.sh dog
+OFFSET_PATH=output/ada_offset/dog_prompt_modulation_50steps_bs5/scales_0-3/offset.pth \
+PROMPTS='sleeping on a bed|running through snow|wearing a red hat|seen from behind on a beach|jumping over a fallen log' \
+ALPHAS=0,0.25,0.5,1 CFG=1,1.5 NUM_SAMPLES=5 VARIANTS=combined \
+OUT_DIR=output/ada_offset/dog_prompt_modulation_50steps_bs5/scales_0-3/inference \
+  bash scripts/infer_offset_prompt_modulation.sh dog
 ```
 
-For the first five scales only:
-
-```bash
-LOSS_SCALES=0-4 bash scripts/run_contents_offset.sh dog
-```
-
-To use a different output directory:
-
-```bash
-OUT_DIR=output/ada_offset/my_dog bash scripts/run_contents_offset.sh dog
-```
-
-## 8. Run the original launcher directly
-
-The original friend launcher still expects the DreamBooth-style path `data/dreambooth/dataset/<subject>`. For the copied data and the prepared defaults, use `scripts/run_contents_offset.sh`; it calls the same original `tools/optimize_ada_offset.py` implementation but points it to `contents/<subject>`.
-
-## 9. Common checks
+## 7. Common checks
 
 Check the GPU and FlashAttention installation:
 
@@ -181,4 +180,6 @@ print(flash_attn.__version__)
 PY
 ```
 
-If CUDA memory is insufficient, first use `PN=0.25M`. Keep the model weights in `weights/` and never commit that directory to GitHub.
+If the five-image micro-batch runs out of GPU memory, use a higher-VRAM
+instance. `PN=0.25M` is a lower-resolution diagnostic, not an equivalent 1M
+comparison. Keep model weights in `weights/`; do not commit them to GitHub.

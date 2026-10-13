@@ -106,45 +106,82 @@ bash scripts/run_dog_prompt_modulation_experiment.sh
 ```
 
 The script reads `contents/dog` (or `data/dreambooth/dataset/dog` if the first
-folder is absent). It runs **four independent optimizations** on scales
-`0-3`, `0-4`, `0-5`, and `0-6`. Each run uses the same seed, 50 optimizer
-steps, `batch_size=5`, `grad_accum=1`, BF16, and horizontal flips. With five
-original dog images, the batch contains five randomly selected examples from
-the originals **and their flips**; it is not guaranteed to contain each
-original image once at every step. The loss and learned offset are restricted
-to that run's scale range.
+folder is absent). It runs **five independent optimizations per scale range**
+on scales `0-3`, `0-4`, `0-5`, and `0-6`: 20 saved offsets in total. The five
+training seeds are `0 1 2 3 4`; each run uses 50 optimizer steps,
+`batch_size=5`, `grad_accum=1`, and BF16. The script requires exactly five
+original images. Each step sends all five originals through one batched
+forward/backward pass, averages their reconstruction losses, and updates the
+shared offset once. Horizontal flips and bitwise self-correction noise are
+disabled; preprocessing still resizes and center-crops images to the model's
+resolution. The training seed changes only the order within this full batch,
+so the five saved offsets may be nearly identical. Each `offset.pth` records
+its seed. The loss and learned offset are restricted to that run's scale
+range.
 
 After each optimization, inference keeps `cfg_uncond` as the base condition,
 adds the learned offset only on its trained scales, and injects the new prompt
-through cross-attention **and** `alpha * (G_prompt - G_null)` on every scale.
-The five default prompts contain no word "dog": sleeping on a bed, running
-through snow, wearing a red hat, seen from behind on a beach, and jumping over
-a fallen log. For each scale range it tests alpha `0,0.25,0.5,1`, CFG `1,1.5`,
-and seeds `0..4`: **200 generated images per range, 800 total**. CFG `1` uses
-only the conditional row; CFG `1.5` also evaluates the null cross-attention
-row with the same subject offset.
+through `alpha * (G_prompt - G_null)` on every scale. By default
+`PROMPT_CA_KV=1` also injects the prompt through cross-attention. Set
+`PROMPT_CA_KV=0` to keep cross-attention on the null text at **all** scales
+while retaining the prompt-derived AdaLN delta. The null condition remains
+the source of SOS and the output head in both cases. This toggle affects the
+`combined` inference variant, not optimization or explicit `ca_prompt`/
+`baseline` variants.
+
+Each of the five prompts explicitly mentions the entity: "a dog sleeping on a
+bed", "a dog running through snow", "a dog wearing a red hat", "a dog seen
+from behind on a beach", and "a dog jumping over a fallen log". This tests
+text-guided editing **with the class noun present**; it is no longer an
+entity-free-prompt test. For **each learned offset** it tests alpha
+`0,0.25,0.5,1` and CFG `1,1.5`, using **one fixed inference seed (`0`)**:
+40 generated images per offset, 200 per scale range, 800 total. The five seeds
+apply to optimization, **not** to inference. CFG `1` uses only the conditional
+row; CFG `1.5` also evaluates the null cross-attention row with the same
+subject offset.
 
 Results are stored separately:
 
 ```text
-output/ada_offset/dog_prompt_modulation_50steps_bs5/
+output/ada_offset/dog_prompt_modulation_50steps_bs5_train5/
 ├── scales_0-3/
-│   ├── offset.pth
-│   ├── optimize.log
-│   ├── optimization_reconstruction.jpg
-│   └── inference/dog/<prompt>/grid.jpg
+│   ├── train_seed0/
+│   │   ├── offset.pth
+│   │   ├── optimize.log
+│   │   ├── optimization_reconstruction.jpg
+│   │   └── inference_ca1/dog/<prompt>/grid.jpg
+│   ├── train_seed1/
+│   ├── train_seed2/
+│   ├── train_seed3/
+│   └── train_seed4/
 ├── scales_0-4/
 ├── scales_0-5/
 └── scales_0-6/
 ```
 
 Individual generated images and `infer.log` are also saved under each
-`inference/` directory. For a quick single-range test before launching all
-four runs:
+`inference_ca1/` directory (or `inference_ca0/` when CA prompt injection is
+disabled). To test an existing offset without optimizing again, run:
 
 ```bash
-SCALE_ENDS=4 bash scripts/run_dog_prompt_modulation_experiment.sh
+PROMPT_CA_KV=0 OFFSET_PATH=output/ada_offset/dog_prompt_modulation_50steps_bs5_train5/scales_0-3/train_seed0/offset.pth \
+  VARIANTS=combined PROMPTS='a dog sleeping on a bed' ALPHAS=0,0.25,0.5,1 CFG=1,1.5 \
+  bash scripts/infer_offset_prompt_modulation.sh dog
 ```
+
+The resulting `combined` images have `ca_kv = null` at all scales; only the
+AdaLN delta carries the edit prompt. Use `PROMPT_CA_KV=1` to compare the
+prompt-cross-attention branch with the same saved offset. For a quick
+single-range test before launching all four scale ranges and all five training
+seeds:
+
+```bash
+EXPERIMENT_DIR=output/ada_offset/dog_prompt_modulation_smoke \
+SCALE_ENDS=4 TRAIN_SEEDS='0' bash scripts/run_dog_prompt_modulation_experiment.sh
+```
+
+Set `TRAIN_SEEDS='0 1 2 3 4'` to select training runs, or
+`INFER_SEED=7` to change the single inference seed **for every offset**.
 
 To change the data or output location:
 
@@ -158,10 +195,10 @@ choose a new `EXPERIMENT_DIR`. If a run stops after saving its offset, rerun
 inference only, for example:
 
 ```bash
-OFFSET_PATH=output/ada_offset/dog_prompt_modulation_50steps_bs5/scales_0-3/offset.pth \
-PROMPTS='sleeping on a bed|running through snow|wearing a red hat|seen from behind on a beach|jumping over a fallen log' \
-ALPHAS=0,0.25,0.5,1 CFG=1,1.5 NUM_SAMPLES=5 VARIANTS=combined \
-OUT_DIR=output/ada_offset/dog_prompt_modulation_50steps_bs5/scales_0-3/inference \
+OFFSET_PATH=output/ada_offset/dog_prompt_modulation_50steps_bs5_train5/scales_0-3/train_seed0/offset.pth \
+PROMPTS='a dog sleeping on a bed|a dog running through snow|a dog wearing a red hat|a dog seen from behind on a beach|a dog jumping over a fallen log' \
+ALPHAS=0,0.25,0.5,1 CFG=1,1.5 ITER=50 SEED=0 NUM_SAMPLES=1 VARIANTS=combined \
+OUT_DIR=output/ada_offset/dog_prompt_modulation_50steps_bs5_train5/scales_0-3/train_seed0/inference_ca1 \
   bash scripts/infer_offset_prompt_modulation.sh dog
 ```
 

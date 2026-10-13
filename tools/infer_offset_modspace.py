@@ -164,9 +164,12 @@ def build_variants(args, prompt, offset_desc, delta_scales, delta_weights, cfgs,
     if 'ca_prompt' in args.variants:
         add('ca_prompt', (NULL, PROMPT, True, 0.), 'prompt only via ca_kv', f'gss_null + offset, ca_kv = "{prompt}"')
     if 'combined' in args.variants:
+        ca_src = PROMPT if args.prompt_ca_kv else NULL
+        ca_name = 'ca_prompt' if args.prompt_ca_kv else 'ca_null'
+        ca_desc = f'ca_kv = "{prompt}"' if args.prompt_ca_kv else 'ca_kv = null'
         for w in delta_weights:
-            add(f'mod_delta{w:g}_ca_prompt', (NULL, PROMPT, True, w), f'mod delta x{w:g} + prompt via ca_kv',
-                f'gss_null + offset + {w:g}*(gss_prompt - gss_null) {delta_desc}, ca_kv = "{prompt}"')
+            add(f'mod_delta{w:g}_{ca_name}', (NULL, ca_src, True, w), f'mod delta x{w:g} ({ca_desc})',
+                f'gss_null + offset + {w:g}*(gss_prompt - gss_null) {delta_desc}, {ca_desc}')
     if 'baseline' in args.variants:
         variants.append(('baseline_', [(PROMPT, PROMPT, False, 0.), (NULL_P, NULL_P, False, 0.)], args.base_cfg, args.base_tau,
                          f'pretrained (no offset)\nprompt "{prompt}" on all paths, cfg={args.base_cfg:g}, tau={args.base_tau:g}\n{seeds}'))
@@ -191,6 +194,7 @@ if __name__ == '__main__':
     parser.add_argument('--prompts', type=str, default=DEFAULT_PROMPTS, help="'dreambooth' (official 25 per subject) or '|'-separated; '{}' is replaced by the subject's class")
     parser.add_argument('--delta_weights', type=str, default='1', help="comma-separated lambdas for gss_null + offset + lambda*(gss_prompt - gss_null), one row each")
     parser.add_argument('--delta_scales', type=str, default='all', help="scales where the modulation delta is added: 'all', '0-6', ...")
+    parser.add_argument('--prompt_ca_kv', type=int, default=1, choices=[0, 1], help='combined variant: 1 uses the prompt for cross-attention; 0 keeps null cross-attention at every scale (prompt only affects the AdaLN delta)')
     parser.add_argument('--offset_scales', type=str, default='all', help="scales where the offset is added ('all' = as trained: the offset is zero past its trained scales)")
     parser.add_argument('--offset_scale', type=float, default=1.0, help='multiply the learned offset')
     parser.add_argument('--offset_tau', type=float, default=1.0, help='temperature of the offset-only row (the offset was sampled with 1.0)')

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Prompt + learned subject offset, with the prompt entering BOTH CA and AdaLN:
+# Prompt + learned subject offset; PROMPT_CA_KV=0 keeps cross-attention null.
 #   trained scales: G_null + D_s + alpha * (G_prompt - G_null)
 #   other scales:   G_null       + alpha * (G_prompt - G_null)
 # The CFG partner has the same subject offset but null CA and null AdaLN.
 # Usage: bash scripts/infer_offset_prompt_modulation.sh dog
-# Example: PROMPTS='is sleeping|wearing a red hat' ALPHAS=0,0.25,0.5 CFG=3 \
+# Example: PROMPTS='a dog sleeping|a dog wearing a red hat' ALPHAS=0,0.25,0.5 CFG=3 \
 #          bash scripts/infer_offset_prompt_modulation.sh dog
 # For a single checkpoint: OFFSET_PATH=output/ada_offset_hybrid/dog_ls0-3/offset.pth \
 #          bash scripts/infer_offset_prompt_modulation.sh dog
@@ -18,18 +18,21 @@ PN="${PN:-1M}"
 RUN_DIR="${RUN_DIR:-output/ada_offset/dreambooth_ls0-6_bs1}"
 OFFSET_PATH="${OFFSET_PATH:-}"
 ITER="${ITER:-100}"
-PROMPTS="${PROMPTS:-'is sleeping|wearing a red hat'}"
+DEFAULT_PROMPTS='a {} sleeping|a {} wearing a red hat'
+PROMPTS="${PROMPTS:-$DEFAULT_PROMPTS}"
 ALPHAS="${ALPHAS:-0,0.25,0.5,1}"
 CFG="${CFG:-3}"
 TAU="${TAU:-1}"
 NUM_SAMPLES="${NUM_SAMPLES:-1}"
 VARIANTS="${VARIANTS:-offset,combined}"
+PROMPT_CA_KV="${PROMPT_CA_KV:-1}"
 SEED="${SEED:-0}"
+[[ "$PROMPT_CA_KV" == 0 || "$PROMPT_CA_KV" == 1 ]] || { echo 'PROMPT_CA_KV must be 0 or 1' >&2; exit 1; }
 if [[ -n "$OFFSET_PATH" ]]; then
-    DEFAULT_OUT_DIR="$(dirname "$OFFSET_PATH")/prompt_modulation"
-    SOURCE_ARGS=(--offset_path "$OFFSET_PATH")
+    DEFAULT_OUT_DIR="$(dirname "$OFFSET_PATH")/prompt_modulation_ca${PROMPT_CA_KV}"
+    SOURCE_ARGS=(--offset_path "$OFFSET_PATH" --iter "$ITER")
 else
-    DEFAULT_OUT_DIR="${RUN_DIR}/prompt_modulation_it$(printf '%05d' "$ITER")"
+    DEFAULT_OUT_DIR="${RUN_DIR}/prompt_modulation_ca${PROMPT_CA_KV}_it$(printf '%05d' "$ITER")"
     SOURCE_ARGS=(--run_dir "$RUN_DIR" --iter "$ITER")
 fi
 OUT_DIR="${OUT_DIR:-$DEFAULT_OUT_DIR}"
@@ -58,7 +61,7 @@ mkdir -p "$OUT_DIR"
     --checkpoint_type torch --bf16 1 --text_channels 2048 \
     --text_encoder_ckpt weights/flan-t5-xl \
     "${SOURCE_ARGS[@]}" --subjects "$subjects" --classes "$CLASSES" \
-    --prompts "$PROMPTS" --delta_weights "$ALPHAS" --delta_scales all \
+    --prompts "$PROMPTS" --delta_weights "$ALPHAS" --delta_scales all --prompt_ca_kv "$PROMPT_CA_KV" \
     --offset_scales all --variants "$VARIANTS" \
     --cfg "$CFG" --tau "$TAU" --seed "$SEED" --num_samples "$NUM_SAMPLES" \
     --out_dir "$OUT_DIR" \

@@ -77,12 +77,15 @@ def encode_texts(infinity, null_len, prompt_cond):
 
 
 @torch.no_grad()
-def modspace_infer(infinity, vae, texts, offset, rows, scale_schedule, offset_scales, delta_scales, cfg, tau, seed, args):
+def modspace_infer(infinity, vae, texts, offset, rows, scale_schedule, offset_scales, delta_scales, cfg, tau, seed, args,
+                   scale_coefficients=None):
     """
     rows: [cond] or [cond, uncond], each (cond_src, ca_src, use_offset, delta_w):
         sos / head adaLN / gss base from texts[cond_src], cross-attention on texts[ca_src],
         gss += offset[si] (if use_offset and si in offset_scales) + delta_w * (gss_prompt - gss_null) (if si in delta_scales)
     offset: (S, 1, 6, C), or (1, 1, 6, C) in shared mode; returns one HW3 uint8 BGR image
+    scale_coefficients: optional {scale_index: (conditional_offset_weight, conditional_delta_weight)}.
+        Only row 0 is overridden; row 1 (the CFG null partner) retains its weights from rows.
     """
     sos_all, gss_all, ca_all = texts
     n = len(rows)
@@ -96,6 +99,18 @@ def modspace_infer(infinity, vae, texts, offset, rows, scale_schedule, offset_sc
     offset = offset.to(gss_base)
     use_offset = torch.tensor([float(r[2]) for r in rows], device=gss_base.device).view(n, 1, 1, 1)
     delta_w = torch.tensor([float(r[3]) for r in rows], device=gss_base.device).view(n, 1, 1, 1)
+    scale_coefficients = scale_coefficients or {}
+    if any(si < 0 or si >= len(scale_schedule) or len(weights) != 2
+           for si, weights in scale_coefficients.items()):
+        raise ValueError("scale_coefficients must map valid scale indices to (offset_weight, delta_weight)")
+    per_scale_weights = {}
+    for si, (offset_weight, delta_weight) in scale_coefficients.items():
+        per_scale_weights[si] = (
+            torch.tensor([float(offset_weight), *[float(r[2]) for r in rows[1:]]],
+                         device=gss_base.device).view(n, 1, 1, 1),
+            torch.tensor([float(delta_weight), *[float(r[3]) for r in rows[1:]]],
+                         device=gss_base.device).view(n, 1, 1, 1),
+        )
     infinity.rng.manual_seed(seed)
     rng = infinity.rng
 
@@ -105,11 +120,12 @@ def modspace_infer(infinity, vae, texts, offset, rows, scale_schedule, offset_sc
             (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True)
         summed_codes = 0
         for si, pn in enumerate(scale_schedule):
+            use_offset_si, delta_w_si = per_scale_weights.get(si, (use_offset, delta_w))
             gss_si = gss_base
             if si in offset_scales and (offset.shape[0] == 1 or si < offset.shape[0]):
-                gss_si = gss_si + use_offset * offset[0 if offset.shape[0] == 1 else si]
+                gss_si = gss_si + use_offset_si * offset[0 if offset.shape[0] == 1 else si]
             if si in delta_scales:
-                gss_si = gss_si + delta_w * delta
+                gss_si = gss_si + delta_w_si * delta
             for block_idx, chunk in enumerate(infinity.block_chunks):
                 if (infinity.add_lvl_embeding_only_first_block and block_idx == 0) or not infinity.add_lvl_embeding_only_first_block:
                     last_stage = infinity.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=0)

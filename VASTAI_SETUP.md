@@ -119,23 +119,30 @@ so the five saved offsets may be nearly identical. Each `offset.pth` records
 its seed. The loss and learned offset are restricted to that run's scale
 range.
 
-After each optimization, inference keeps `cfg_uncond` as the base condition,
-adds the learned offset only on its trained scales, and injects the new prompt
-through `alpha * (G_prompt - G_null)` on every scale. By default
-`PROMPT_CA_KV=1` also injects the prompt through cross-attention. Set
-`PROMPT_CA_KV=0` to keep cross-attention on the null text at **all** scales
-while retaining the prompt-derived AdaLN delta. The null condition remains
-the source of SOS and the output head in both cases. This toggle affects the
-`combined` inference variant, not optimization or explicit `ca_prompt`/
-`baseline` variants.
+After each optimization, inference keeps `cfg_uncond` as the base condition
+and adds the learned offset only on its trained scales. Two independent
+switches control the `combined` inference variant:
+
+| `PROMPT_CA_KV` | `PROMPT_MOD_DELTA` | Prompt conditioning |
+| --- | --- | --- |
+| `0` | `0` | Neither (offset-only control) |
+| `1` | `0` | Cross-attention only |
+| `0` | `1` | `alpha * (G_prompt - G_null)` in AdaLN only |
+| `1` | `1` | Both (default) |
+
+The null condition remains the source of SOS and the output head in all four
+cases. The switches do not affect optimization or the explicit `mod_delta`,
+`ca_prompt`, and `baseline` variants. When `PROMPT_MOD_DELTA=0`, alpha has no
+effect, so inference generates only one result per prompt and CFG setting.
 
 Each of the five prompts explicitly mentions the entity: "a dog sleeping on a
 bed", "a dog running through snow", "a dog wearing a red hat", "a dog seen
 from behind on a beach", and "a dog jumping over a fallen log". This tests
 text-guided editing **with the class noun present**; it is no longer an
-entity-free-prompt test. For **each learned offset** it tests alpha
-`0,0.25,0.5,1` and CFG `1,1.5`, using **one fixed inference seed (`0`)**:
-40 generated images per offset, 200 per scale range, 800 total. The five seeds
+entity-free-prompt test. By default, **each learned offset** tests alpha
+`0.1,0.2,0.3,0.4,0.5` and CFG `1,1.5`, using **one fixed inference seed (`0`)**:
+50 generated images per offset, 250 per scale range, 1000 total. With
+`PROMPT_MOD_DELTA=0`, there are 10 generated images per offset. The five seeds
 apply to optimization, **not** to inference. CFG `1` uses only the conditional
 row; CFG `1.5` also evaluates the null cross-attention row with the same
 subject offset.
@@ -149,7 +156,7 @@ output/ada_offset/dog_prompt_modulation_50steps_bs5_train5/
 │   │   ├── offset.pth
 │   │   ├── optimize.log
 │   │   ├── optimization_reconstruction.jpg
-│   │   └── inference_ca1/dog/<prompt>/grid.jpg
+│   │   └── inference_ca1_mod1/dog/<prompt>/grid.jpg
 │   ├── train_seed1/
 │   ├── train_seed2/
 │   ├── train_seed3/
@@ -160,18 +167,19 @@ output/ada_offset/dog_prompt_modulation_50steps_bs5_train5/
 ```
 
 Individual generated images and `infer.log` are also saved under each
-`inference_ca1/` directory (or `inference_ca0/` when CA prompt injection is
-disabled). To test an existing offset without optimizing again, run:
+`inference_ca1_mod1/` directory by default. The two suffixes record the
+switches. To test an existing offset without optimizing again, run:
 
 ```bash
-PROMPT_CA_KV=0 OFFSET_PATH=output/ada_offset/dog_prompt_modulation_50steps_bs5_train5/scales_0-3/train_seed0/offset.pth \
-  VARIANTS=combined PROMPTS='a dog sleeping on a bed' ALPHAS=0,0.25,0.5,1 CFG=1,1.5 \
+PROMPT_CA_KV=0 PROMPT_MOD_DELTA=1 \
+  OFFSET_PATH=output/ada_offset/dog_prompt_modulation_50steps_bs5_train5/scales_0-3/train_seed0/offset.pth \
+  VARIANTS=combined PROMPTS='a dog sleeping on a bed' ALPHAS=0.1,0.2,0.3,0.4,0.5 CFG=1,1.5 \
   bash scripts/infer_offset_prompt_modulation.sh dog
 ```
 
 The resulting `combined` images have `ca_kv = null` at all scales; only the
-AdaLN delta carries the edit prompt. Use `PROMPT_CA_KV=1` to compare the
-prompt-cross-attention branch with the same saved offset. For a quick
+AdaLN delta carries the edit prompt. Set `PROMPT_CA_KV=1 PROMPT_MOD_DELTA=0`
+to test cross-attention only with the same saved offset. For a quick
 single-range test before launching all four scale ranges and all five training
 seeds:
 
@@ -197,8 +205,8 @@ inference only, for example:
 ```bash
 OFFSET_PATH=output/ada_offset/dog_prompt_modulation_50steps_bs5_train5/scales_0-3/train_seed0/offset.pth \
 PROMPTS='a dog sleeping on a bed|a dog running through snow|a dog wearing a red hat|a dog seen from behind on a beach|a dog jumping over a fallen log' \
-ALPHAS=0,0.25,0.5,1 CFG=1,1.5 ITER=50 SEED=0 NUM_SAMPLES=1 VARIANTS=combined \
-OUT_DIR=output/ada_offset/dog_prompt_modulation_50steps_bs5_train5/scales_0-3/train_seed0/inference_ca1 \
+ALPHAS=0.1,0.2,0.3,0.4,0.5 CFG=1,1.5 ITER=50 SEED=0 NUM_SAMPLES=1 VARIANTS=combined \
+OUT_DIR=output/ada_offset/dog_prompt_modulation_50steps_bs5_train5/scales_0-3/train_seed0/inference_ca1_mod1 \
   bash scripts/infer_offset_prompt_modulation.sh dog
 ```
 

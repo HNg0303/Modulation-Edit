@@ -20,11 +20,12 @@ SCALE_ENDS="${SCALE_ENDS:-3 4 5 6}"
 TRAIN_SEEDS="${TRAIN_SEEDS:-0 1 2 3 4}"
 INFER_SEED="${INFER_SEED:-0}"
 PROMPT_CA_KV="${PROMPT_CA_KV:-1}"
+PROMPT_MOD_DELTA="${PROMPT_MOD_DELTA:-1}"
 LR="${LR:-5e-3}"
 EXPERIMENT_DIR="${EXPERIMENT_DIR:-output/ada_offset/dog_prompt_modulation_${STEPS}steps_bs5_train5}"
 DEFAULT_PROMPTS='a dog sleeping on a bed|a dog running through snow|a dog wearing a red hat|a dog seen from behind on a beach|a dog jumping over a fallen log'
 PROMPTS="${PROMPTS:-$DEFAULT_PROMPTS}"
-ALPHAS="${ALPHAS:-0,0.25,0.5,1}"
+ALPHAS="${ALPHAS:-0.1,0.2,0.3,0.4,0.5}"
 CFG="${CFG:-1,1.5}"
 
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || { echo "Python not found: $PYTHON_BIN" >&2; exit 1; }
@@ -53,6 +54,7 @@ for end_scale in "${SCALE_LIST[@]}"; do
 done
 [[ "$INFER_SEED" =~ ^[0-9]+$ ]] || { echo "Invalid inference seed: $INFER_SEED" >&2; exit 1; }
 [[ "$PROMPT_CA_KV" == 0 || "$PROMPT_CA_KV" == 1 ]] || { echo 'PROMPT_CA_KV must be 0 or 1' >&2; exit 1; }
+[[ "$PROMPT_MOD_DELTA" == 0 || "$PROMPT_MOD_DELTA" == 1 ]] || { echo 'PROMPT_MOD_DELTA must be 0 or 1' >&2; exit 1; }
 
 for end_scale in "${SCALE_LIST[@]}"; do
     loss_scales="0-${end_scale}"
@@ -78,8 +80,9 @@ for end_scale in "${SCALE_LIST[@]}"; do
 
         echo "Testing offset from training seed $train_seed with one fixed inference seed $INFER_SEED."
         PYTHON_BIN="$PYTHON_BIN" PN="$PN" ITER="$STEPS" OFFSET_PATH="$run_dir/offset.pth" \
-        PROMPTS="$PROMPTS" ALPHAS="$ALPHAS" CFG="$CFG" SEED="$INFER_SEED" PROMPT_CA_KV="$PROMPT_CA_KV" \
-        NUM_SAMPLES=1 VARIANTS=combined OUT_DIR="$run_dir/inference_ca${PROMPT_CA_KV}" \
+        PROMPTS="$PROMPTS" ALPHAS="$ALPHAS" CFG="$CFG" SEED="$INFER_SEED" \
+        PROMPT_CA_KV="$PROMPT_CA_KV" PROMPT_MOD_DELTA="$PROMPT_MOD_DELTA" \
+        NUM_SAMPLES=1 VARIANTS=combined OUT_DIR="$run_dir/inference_ca${PROMPT_CA_KV}_mod${PROMPT_MOD_DELTA}" \
             bash scripts/infer_offset_prompt_modulation.sh dog
     done
 done

@@ -167,8 +167,10 @@ def build_variants(args, prompt, offset_desc, delta_scales, delta_weights, cfgs,
         ca_src = PROMPT if args.prompt_ca_kv else NULL
         ca_name = 'ca_prompt' if args.prompt_ca_kv else 'ca_null'
         ca_desc = f'ca_kv = "{prompt}"' if args.prompt_ca_kv else 'ca_kv = null'
-        for w in delta_weights:
-            add(f'mod_delta{w:g}_{ca_name}', (NULL, ca_src, True, w), f'mod delta x{w:g} ({ca_desc})',
+        weights = delta_weights if args.prompt_mod_delta else [0.]
+        for w in weights:
+            mod_name = f'mod_delta{w:g}' if args.prompt_mod_delta else 'mod_off'
+            add(f'{mod_name}_{ca_name}', (NULL, ca_src, True, w), f'{mod_name} ({ca_desc})',
                 f'gss_null + offset + {w:g}*(gss_prompt - gss_null) {delta_desc}, {ca_desc}')
     if 'baseline' in args.variants:
         variants.append(('baseline_', [(PROMPT, PROMPT, False, 0.), (NULL_P, NULL_P, False, 0.)], args.base_cfg, args.base_tau,
@@ -192,9 +194,10 @@ if __name__ == '__main__':
     parser.add_argument('--subjects', type=str, default='', help='comma-separated; default: every subject in run_dir')
     parser.add_argument('--classes', type=str, default='data/dreambooth/dataset/prompts_and_classes.txt')
     parser.add_argument('--prompts', type=str, default=DEFAULT_PROMPTS, help="'dreambooth' (official 25 per subject) or '|'-separated; '{}' is replaced by the subject's class")
-    parser.add_argument('--delta_weights', type=str, default='1', help="comma-separated lambdas for gss_null + offset + lambda*(gss_prompt - gss_null), one row each")
+    parser.add_argument('--delta_weights', type=str, default='0.1,0.2,0.3,0.4,0.5', help="comma-separated alphas for gss_null + offset + alpha*(gss_prompt - gss_null), one row each when enabled")
     parser.add_argument('--delta_scales', type=str, default='all', help="scales where the modulation delta is added: 'all', '0-6', ...")
     parser.add_argument('--prompt_ca_kv', type=int, default=1, choices=[0, 1], help='combined variant: 1 uses the prompt for cross-attention; 0 keeps null cross-attention at every scale (prompt only affects the AdaLN delta)')
+    parser.add_argument('--prompt_mod_delta', type=int, default=1, choices=[0, 1], help='combined variant: 1 applies alpha*(G_prompt-G_null); 0 disables that direction and ignores the alpha sweep')
     parser.add_argument('--offset_scales', type=str, default='all', help="scales where the offset is added ('all' = as trained: the offset is zero past its trained scales)")
     parser.add_argument('--offset_scale', type=float, default=1.0, help='multiply the learned offset')
     parser.add_argument('--offset_tau', type=float, default=1.0, help='temperature of the offset-only row (the offset was sampled with 1.0)')

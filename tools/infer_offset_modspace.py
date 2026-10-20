@@ -55,15 +55,19 @@ DREAMBOOTH_LIVE = DREAMBOOTH_COMMON + [
     'a {} wearing a yellow shirt', 'a {} in a purple wizard outfit'] + DREAMBOOTH_PROPERTY
 LIVE_SUBJECTS = {'cat', 'cat2', 'dog', 'dog2', 'dog3', 'dog5', 'dog6', 'dog7', 'dog8'}
 
-NULL, PROMPT, NULL_P = 0, 1, 2  # text sources: offset's null text (cfg_uncond[:null_len]), T5(prompt), cfg_uncond[:len(prompt)]
+NULL, PROMPT, NULL_P = 0, 1, 2  # text sources: fixed-length null, T5(prompt), fixed-length null for the baseline row
 
 
 @torch.no_grad()
 def encode_texts(infinity, null_len, prompt_cond):
     """-> sos (3, D), gss (3, 1, 6, C), per-token ca features [(len_i, D)] for the NULL, PROMPT, NULL_P texts"""
     p_kv, p_lens, _, _ = prompt_cond
-    lens = [null_len, p_lens[0], p_lens[0]]
-    kv = torch.cat([infinity.cfg_uncond[:null_len].float(), p_kv.float(), infinity.cfg_uncond[:p_lens[0]].float()], 0)
+    assert 0 < null_len <= len(infinity.cfg_uncond), 'null_len must fit cfg_uncond'
+    # The null text stays at the checkpoint's length (normally 32), even when the
+    # prompt has a different number of tokens. Each source gets its own prefix sum.
+    null_kv = infinity.cfg_uncond[:null_len].float()
+    lens = [null_len, p_lens[0], null_len]
+    kv = torch.cat([null_kv, p_kv.float(), null_kv], 0)
     cu_seqlens_k = F.pad(torch.tensor(lens, device=kv.device, dtype=torch.int32).cumsum(0, dtype=torch.int32), (1, 0))
     with torch.autocast('cuda', dtype=torch.bfloat16):
         kv = infinity.text_norm(kv)
@@ -105,9 +109,10 @@ def modspace_infer(infinity, vae, texts, offset, rows, scale_schedule, offset_sc
             (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True)
         summed_codes = 0
         for si, pn in enumerate(scale_schedule):
+            use_offset_si, delta_w_si = per_scale_weights.get(si, (use_offset, delta_w))
             gss_si = gss_base
-            if si in offset_scales and si < offset.shape[0]:
-                gss_si = gss_si + use_offset * offset[si]
+            if si in offset_scales and (offset.shape[0] == 1 or si < offset.shape[0]):
+                gss_si = gss_si + use_offset_si * offset[0 if offset.shape[0] == 1 else si]
             if si in delta_scales:
                 gss_si = gss_si + delta_w * delta
             head_cond = cond_BD
@@ -172,9 +177,14 @@ def build_variants(args, prompt, offset_desc, delta_scales, delta_weights, cfgs,
     if 'ca_prompt' in args.variants:
         add('ca_prompt', (NULL, PROMPT, True, 0.), 'prompt only via ca_kv', f'gss_null + offset, ca_kv = "{prompt}"')
     if 'combined' in args.variants:
-        for w in delta_weights:
-            add(f'mod_delta{w:g}_ca_prompt', (NULL, PROMPT, True, w), f'mod delta x{w:g} + prompt via ca_kv',
-                f'gss_null + offset + {w:g}*(gss_prompt - gss_null) {delta_desc}, ca_kv = "{prompt}"')
+        ca_src = PROMPT if args.prompt_ca_kv else NULL
+        ca_name = 'ca_prompt' if args.prompt_ca_kv else 'ca_null'
+        ca_desc = f'ca_kv = "{prompt}"' if args.prompt_ca_kv else 'ca_kv = null'
+        weights = delta_weights if args.prompt_mod_delta else [0.]
+        for w in weights:
+            mod_name = f'mod_delta{w:g}' if args.prompt_mod_delta else 'mod_off'
+            add(f'{mod_name}_{ca_name}', (NULL, ca_src, True, w), f'{mod_name} ({ca_desc})',
+                f'gss_null + offset + {w:g}*(gss_prompt - gss_null) {delta_desc}, {ca_desc}')
     if 'baseline' in args.variants:
         variants.append(('baseline_', [(PROMPT, PROMPT, False, 0.), (NULL_P, NULL_P, False, 0.)], args.base_cfg, args.base_tau,
                          f'pretrained (no offset)\nprompt "{prompt}" on all paths, cfg={args.base_cfg:g}, tau={args.base_tau:g}\n{seeds}'))
@@ -191,13 +201,16 @@ def prompt_templates(spec, subject):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     add_common_arguments(parser)
-    parser.add_argument('--run_dir', type=str, required=True, help='output of scripts/optimize_ada_offset_dreambooth_all.sh')
+    parser.add_argument('--run_dir', type=str, default='', help='output of scripts/optimize_ada_offset_dreambooth_all.sh')
+    parser.add_argument('--offset_path', type=str, default='', help='alternatively, infer one subject from a direct offset.pth path')
     parser.add_argument('--iter', type=int, default=100, help='which snapshot: <run_dir>/<subject>/itXXXXX/offset.pth')
     parser.add_argument('--subjects', type=str, default='', help='comma-separated; default: every subject in run_dir')
     parser.add_argument('--classes', type=str, default='data/dreambooth/dataset/prompts_and_classes.txt')
     parser.add_argument('--prompts', type=str, default=DEFAULT_PROMPTS, help="'dreambooth' (official 25 per subject) or '|'-separated; '{}' is replaced by the subject's class")
-    parser.add_argument('--delta_weights', type=str, default='1', help="comma-separated lambdas for gss_null + offset + lambda*(gss_prompt - gss_null), one row each")
+    parser.add_argument('--delta_weights', type=str, default='0.1,0.2,0.3,0.4,0.5', help="comma-separated alphas for gss_null + offset + alpha*(gss_prompt - gss_null), one row each when enabled")
     parser.add_argument('--delta_scales', type=str, default='all', help="scales where the modulation delta is added: 'all', '0-6', ...")
+    parser.add_argument('--prompt_ca_kv', type=int, default=1, choices=[0, 1], help='combined variant: 1 uses the prompt for cross-attention; 0 keeps null cross-attention at every scale (prompt only affects the AdaLN delta)')
+    parser.add_argument('--prompt_mod_delta', type=int, default=1, choices=[0, 1], help='combined variant: 1 applies alpha*(G_prompt-G_null); 0 disables that direction and ignores the alpha sweep')
     parser.add_argument('--offset_scales', type=str, default='all', help="scales where the offset is added ('all' = as trained: the offset is zero past its trained scales)")
     parser.add_argument('--prompt_cond_scales', type=str, default='',
                         help="scales where the edited rows use the prompt's cond_BD (gss_prompt, head adaLN) instead of null + offset, e.g. '7-12'; '' = off")
@@ -219,12 +232,19 @@ if __name__ == '__main__':
     assert args.variants <= {'offset', 'mod_delta', 'mod_prompt', 'ca_prompt', 'combined', 'baseline'}, args.variants
     assert args.use_bit_label and args.vae_type != 0 and not args.apply_spatial_patchify, 'only the bitwise, non-patchified setup (Infinity-2B) is supported'
     delta_weights = [float(w) for w in args.delta_weights.split(',') if w]
+    if not args.run_dir and not args.offset_path:
+        parser.error('provide --run_dir or --offset_path')
+    if args.offset_path and args.subjects and ',' in args.subjects:
+        parser.error('--offset_path supports one subject only')
 
     tag = f'it{args.iter:05d}'
-    out_dir = args.out_dir or osp.join(args.run_dir, f'modspace_infer_{tag}')
-    subjects = args.subjects.split(',') if args.subjects else sorted(
-        s for s in os.listdir(args.run_dir) if osp.isfile(osp.join(args.run_dir, s, tag, 'offset.pth')))
-    classes = read_classes(args.classes)
+    out_dir = args.out_dir or osp.join(args.run_dir or osp.dirname(args.offset_path), f'modspace_infer_{tag}')
+    if args.offset_path:
+        subjects = [args.subjects or osp.basename(osp.dirname(args.offset_path))]
+    else:
+        subjects = args.subjects.split(',') if args.subjects else sorted(
+            s for s in os.listdir(args.run_dir) if osp.isfile(osp.join(args.run_dir, s, tag, 'offset.pth')))
+    classes = read_classes(args.classes) if osp.isfile(args.classes) else {}
 
     vae = load_visual_tokenizer(args)
     vae.requires_grad_(False)
@@ -235,13 +255,18 @@ if __name__ == '__main__':
     prompt_cache = {}
 
     for subject in subjects:
-        ckpt = torch.load(osp.join(args.run_dir, subject, tag, 'offset.pth'), map_location='cpu')
+        ckpt_path = args.offset_path or osp.join(args.run_dir, subject, tag, 'offset.pth')
+        ckpt = torch.load(ckpt_path, map_location='cpu')
         offset = (ckpt['ada_offset'] * args.offset_scale).reshape(-1, 1, 6, infinity.C).cuda()
         null_len = ckpt.get('null_len', 32)
         h_div_w = args.h_div_w_template if args.h_div_w_template > 0 else ckpt.get('h_div_w_template', 1.0)
         _, scale_schedule, _ = get_scale_schedule(args, h_div_w)
         all_scales = set(range(len(scale_schedule)))
+        if not 1 <= offset.shape[0] <= len(scale_schedule):
+            raise ValueError(f'{subject}: expected 1 to {len(scale_schedule)} scale offsets, got {offset.shape[0]}')
         offset_scales = set(parse_scales(args.offset_scales, len(scale_schedule)))
+        if 'loss_scales' in ckpt:
+            offset_scales &= set(ckpt['loss_scales'])  # never inject D_s at an unsupervised scale
         delta_scales = set(parse_scales(args.delta_scales, len(scale_schedule)))
         prompt_cond_scales = set(parse_scales(args.prompt_cond_scales, len(scale_schedule))) if args.prompt_cond_scales else set()
         trained = {si for si in range(offset.shape[0]) if offset[si].abs().sum() > 0} & offset_scales
@@ -252,7 +277,10 @@ if __name__ == '__main__':
         print(f'[{subject}] class={cls!r}, {offset_desc}, delta weights {delta_weights} on scales {fmt_scales(delta_scales)}, cfg={args.cfg} tau={args.tau:g}')
 
         tgt_h, tgt_w = scale_schedule[-1][1] * 16, scale_schedule[-1][2] * 16
-        train_row = reference_row([transform(Image.open(p).convert('RGB'), tgt_h, tgt_w) for p in ckpt['images']])
+        image_paths = ckpt.get('images', [])
+        if image_paths and not all(osp.isfile(p) for p in image_paths):
+            image_paths = [osp.join('contents', subject, osp.basename(p)) for p in image_paths]
+        train_row = reference_row([transform(Image.open(p).convert('RGB'), tgt_h, tgt_w) for p in image_paths]) if image_paths and all(osp.isfile(p) for p in image_paths) else []
         offset_row = None  # the offset-only row does not depend on the prompt: sampled once per subject
         for template in prompt_templates(args.prompts, subject):
             prompt = template.format(cls)
@@ -286,7 +314,8 @@ if __name__ == '__main__':
                 grid_rows.append(row)
                 grid_labels.append(label)
                 print(f'    {label.splitlines()[0]}: {time.time() - stt:.1f}s')
-            grid_rows.append(train_row)
-            grid_labels.append(f'train images\n{len(train_row)} images of {subject}')
+            if train_row:
+                grid_rows.append(train_row)
+                grid_labels.append(f'train images\n{len(train_row)} images of {subject}')
             save_grid(osp.join(prompt_dir, 'grid.jpg'), grid_rows, grid_labels)
             print(f'[saved] {prompt_dir}/grid.jpg')

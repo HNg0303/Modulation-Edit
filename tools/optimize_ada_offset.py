@@ -151,6 +151,8 @@ def generate(infinity, vae, text_cond_tuple, scale_schedule, args, seed, negativ
 
 
 def optimize(args, infinity, vae, device):
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
     paths = list_images(args.images)
     pils = [Image.open(p).convert('RGB') for p in paths]
     # one scale schedule for the whole set so images can be batched: template closest to the median aspect ratio
@@ -190,7 +192,7 @@ def optimize(args, infinity, vae, device):
         torch.save({
             'ada_offset': offset.detach().cpu(), 'offset_mode': args.offset_mode, 'null_len': args.null_len, 'pn': args.pn, 'h_div_w_template': h_div_w_template,
             'images': paths, 'loss_scales': loss_scales, 'batch_size': args.batch_size, 'grad_accum': args.grad_accum,
-            'iters': iters_done, 'lr': args.lr, 'log': list(log),
+            'iters': iters_done, 'lr': args.lr, 'seed': args.seed, 'hflip': args.hflip, 'log': list(log),
         }, path)
         print(f'[saved] offset (it {iters_done}) -> {path}')
 

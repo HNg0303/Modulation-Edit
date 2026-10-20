@@ -8,6 +8,8 @@ Inject the prompt into a learned ada offset sample (trained on the null text) th
     ca_prompt    : gss = gss_null + offset,                                    ca_kv = T5(prompt)
                    (the prompt only enters through cross-attention)
     mod_delta+ca : both of the above
+    --prompt_cond_scales 7-12 (any of the above): on those scales the edited row's cond_BD is the prompt's (gss = gss_prompt, head adaLN on
+                   the prompt, no offset / delta); the other scales keep null + offset; ca_kv is unchanged (prompt on every scale for ca_prompt)
 
 gss_* = shared_ada_lin(text_proj_for_sos(text)), the 6 modulation vectors shared by every block; gss_null uses the null text the
 offset was trained on (cfg_uncond[:null_len]). In these rows the sos token and the head's adaLN (head_nm) always see the null
@@ -73,11 +75,12 @@ def encode_texts(infinity, null_len, prompt_cond):
 
 
 @torch.no_grad()
-def modspace_infer(infinity, vae, texts, offset, rows, scale_schedule, offset_scales, delta_scales, cfg, tau, seed, args):
+def modspace_infer(infinity, vae, texts, offset, rows, scale_schedule, offset_scales, delta_scales, prompt_cond_scales, cfg, tau, seed, args):
     """
-    rows: [cond] or [cond, uncond], each (cond_src, ca_src, use_offset, delta_w):
+    rows: [cond] or [cond, uncond], each (cond_src, ca_src, use_offset, delta_w[, prompt_cond]):
         sos / head adaLN / gss base from texts[cond_src], cross-attention on texts[ca_src],
         gss += offset[si] (if use_offset and si in offset_scales) + delta_w * (gss_prompt - gss_null) (if si in delta_scales)
+        prompt_cond: on prompt_cond_scales the row's cond_BD is the prompt's instead (gss = gss_prompt, head adaLN on the prompt)
     offset: (S, 1, 6, C); returns one HW3 uint8 BGR image
     """
     sos_all, gss_all, ca_all = texts
@@ -92,6 +95,7 @@ def modspace_infer(infinity, vae, texts, offset, rows, scale_schedule, offset_sc
     offset = offset.to(gss_base)
     use_offset = torch.tensor([float(r[2]) for r in rows], device=gss_base.device).view(n, 1, 1, 1)
     delta_w = torch.tensor([float(r[3]) for r in rows], device=gss_base.device).view(n, 1, 1, 1)
+    prompt_cond = torch.tensor([len(r) > 4 and r[4] for r in rows], device=gss_base.device)
     infinity.rng.manual_seed(seed)
     rng = infinity.rng
 
@@ -106,6 +110,10 @@ def modspace_infer(infinity, vae, texts, offset, rows, scale_schedule, offset_sc
                 gss_si = gss_si + use_offset * offset[si]
             if si in delta_scales:
                 gss_si = gss_si + delta_w * delta
+            head_cond = cond_BD
+            if si in prompt_cond_scales and prompt_cond.any():
+                gss_si = torch.where(prompt_cond.view(n, 1, 1, 1), gss_all[PROMPT:PROMPT + 1], gss_si)
+                head_cond = torch.where(prompt_cond.view(n, 1), sos_all[PROMPT:PROMPT + 1], cond_BD)
             for block_idx, chunk in enumerate(infinity.block_chunks):
                 if (infinity.add_lvl_embeding_only_first_block and block_idx == 0) or not infinity.add_lvl_embeding_only_first_block:
                     last_stage = infinity.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=0)
@@ -113,7 +121,7 @@ def modspace_infer(infinity, vae, texts, offset, rows, scale_schedule, offset_sc
                     last_stage = m(x=last_stage, cond_BD=gss_si, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=None,
                                    scale_schedule=scale_schedule, rope2d_freqs_grid=infinity.rope2d_freqs_grid, scale_ind=si)
 
-            logits = infinity.get_logits(last_stage, cond_BD)
+            logits = infinity.get_logits(last_stage, head_cond)
             logits_BlV = (cfg * logits[:1] + (1 - cfg) * logits[1:] if n == 2 else logits).mul(1 / tau)
             idx_Bld = sample_with_top_k_top_p_also_inplace_modifying_logits_(
                 logits_BlV.reshape(1, -1, 2), rng=rng, top_k=args.top_k, top_p=args.top_p, num_samples=1)[:, :, 0]
@@ -134,7 +142,7 @@ def modspace_infer(infinity, vae, texts, offset, rows, scale_schedule, offset_sc
     return img[0].cpu().numpy()  # H W 3, uint8, BGR
 
 
-def build_variants(args, prompt, offset_desc, delta_scales, delta_weights, cfgs, all_scales):
+def build_variants(args, prompt, offset_desc, delta_scales, delta_weights, cfgs, all_scales, prompt_cond_scales):
     """-> [(file prefix, rows, cfg, tau, label)] for the variants in --variants; the prompt-injected rows get one entry per cfg"""
     seeds = f'seeds {args.seed}..{args.seed + args.num_samples - 1}'
     uncond = (NULL, NULL, True, 0.)
@@ -142,6 +150,10 @@ def build_variants(args, prompt, offset_desc, delta_scales, delta_weights, cfgs,
     variants = []
 
     def add(name, cond, title, desc):
+        if prompt_cond_scales:  # cond_BD of the prompt on those scales, tagged in the file name: <name>_pc7-12_cfgX_
+            cond = (*cond, True)
+            name = f'{name}_pc{fmt_scales(prompt_cond_scales)}'
+            title = f'{title} + prompt cond_BD on scales {fmt_scales(prompt_cond_scales)}'
         for cfg in cfgs:
             cfg_desc = f'cfg={cfg:g} vs offset row' if cfg != 1 else 'no cfg'
             variants.append((f'{name}_cfg{cfg:g}_', [cond, uncond] if cfg != 1 else [cond], cfg, args.tau,
@@ -187,6 +199,8 @@ if __name__ == '__main__':
     parser.add_argument('--delta_weights', type=str, default='1', help="comma-separated lambdas for gss_null + offset + lambda*(gss_prompt - gss_null), one row each")
     parser.add_argument('--delta_scales', type=str, default='all', help="scales where the modulation delta is added: 'all', '0-6', ...")
     parser.add_argument('--offset_scales', type=str, default='all', help="scales where the offset is added ('all' = as trained: the offset is zero past its trained scales)")
+    parser.add_argument('--prompt_cond_scales', type=str, default='',
+                        help="scales where the edited rows use the prompt's cond_BD (gss_prompt, head adaLN) instead of null + offset, e.g. '7-12'; '' = off")
     parser.add_argument('--offset_scale', type=float, default=1.0, help='multiply the learned offset')
     parser.add_argument('--offset_tau', type=float, default=1.0, help='temperature of the offset-only row (the offset was sampled with 1.0)')
     parser.add_argument('--variants', type=str, default='offset,mod_delta,ca_prompt,combined,baseline',
@@ -229,6 +243,7 @@ if __name__ == '__main__':
         all_scales = set(range(len(scale_schedule)))
         offset_scales = set(parse_scales(args.offset_scales, len(scale_schedule)))
         delta_scales = set(parse_scales(args.delta_scales, len(scale_schedule)))
+        prompt_cond_scales = set(parse_scales(args.prompt_cond_scales, len(scale_schedule))) if args.prompt_cond_scales else set()
         trained = {si for si in range(offset.shape[0]) if offset[si].abs().sum() > 0} & offset_scales
         offset_desc = f'offset {tag} x{args.offset_scale:g} on scales {fmt_scales(trained)}'
         cls = classes.get(subject, subject.replace('_', ' '))
@@ -253,7 +268,7 @@ if __name__ == '__main__':
             with open(osp.join(prompt_dir, 'prompt.txt'), 'w') as f:
                 f.write(prompt + '\n')
             grid_rows, grid_labels = [], []
-            for prefix, rows, cfg, tau, label in build_variants(args, prompt, offset_desc, delta_scales, delta_weights, cfgs, all_scales):
+            for prefix, rows, cfg, tau, label in build_variants(args, prompt, offset_desc, delta_scales, delta_weights, cfgs, all_scales, prompt_cond_scales):
                 stt = time.time()
                 paths = [osp.join(prompt_dir, f'{prefix}seed{args.seed + i}.jpg') for i in range(args.num_samples)]
                 if args.skip_existing and all(osp.isfile(p) for p in paths):
@@ -261,7 +276,7 @@ if __name__ == '__main__':
                 elif prefix == 'offset_' and offset_row is not None:
                     row = offset_row
                 else:
-                    row = [modspace_infer(infinity, vae, texts, offset, rows, scale_schedule, offset_scales, delta_scales, cfg, tau, args.seed + i, args)
+                    row = [modspace_infer(infinity, vae, texts, offset, rows, scale_schedule, offset_scales, delta_scales, prompt_cond_scales, cfg, tau, args.seed + i, args)
                            for i in range(args.num_samples)]
                 if prefix == 'offset_':
                     offset_row = row

@@ -78,7 +78,7 @@ def encode_texts(infinity, null_len, prompt_cond):
 
 @torch.no_grad()
 def modspace_infer(infinity, vae, texts, offset, rows, scale_schedule, offset_scales, delta_scales, cfg, tau, seed, args,
-                   scale_coefficients=None):
+                   scale_coefficients=None, cfg_by_scale=None):
     """
     rows: [cond] or [cond, uncond], each (cond_src, ca_src, use_offset, delta_w):
         sos / head adaLN / gss base from texts[cond_src], cross-attention on texts[ca_src],
@@ -86,6 +86,8 @@ def modspace_infer(infinity, vae, texts, offset, rows, scale_schedule, offset_sc
     offset: (S, 1, 6, C), or (1, 1, 6, C) in shared mode; returns one HW3 uint8 BGR image
     scale_coefficients: optional {scale_index: (conditional_offset_weight, conditional_delta_weight)}.
         Only row 0 is overridden; row 1 (the CFG null partner) retains its weights from rows.
+    cfg_by_scale: optional {scale_index: guidance_strength}. Both rows must be
+        present from scale 0 when any scale needs CFG, so their KV caches stay aligned.
     """
     sos_all, gss_all, ca_all = texts
     n = len(rows)
@@ -100,6 +102,12 @@ def modspace_infer(infinity, vae, texts, offset, rows, scale_schedule, offset_sc
     use_offset = torch.tensor([float(r[2]) for r in rows], device=gss_base.device).view(n, 1, 1, 1)
     delta_w = torch.tensor([float(r[3]) for r in rows], device=gss_base.device).view(n, 1, 1, 1)
     scale_coefficients = scale_coefficients or {}
+    cfg_by_scale = cfg_by_scale or {}
+    if any(si < 0 or si >= len(scale_schedule) or float(strength) <= 0
+           for si, strength in cfg_by_scale.items()):
+        raise ValueError("cfg_by_scale must map valid scale indices to positive guidance strengths")
+    if n == 1 and any(float(strength) != 1.0 for strength in cfg_by_scale.values()):
+        raise ValueError("Scale-dependent CFG needs both conditional and unconditional rows from scale 0")
     if any(si < 0 or si >= len(scale_schedule) or len(weights) != 2
            for si, weights in scale_coefficients.items()):
         raise ValueError("scale_coefficients must map valid scale indices to (offset_weight, delta_weight)")
@@ -134,7 +142,8 @@ def modspace_infer(infinity, vae, texts, offset, rows, scale_schedule, offset_sc
                                    scale_schedule=scale_schedule, rope2d_freqs_grid=infinity.rope2d_freqs_grid, scale_ind=si)
 
             logits = infinity.get_logits(last_stage, cond_BD)
-            logits_BlV = (cfg * logits[:1] + (1 - cfg) * logits[1:] if n == 2 else logits).mul(1 / tau)
+            cfg_si = float(cfg_by_scale.get(si, cfg))
+            logits_BlV = (cfg_si * logits[:1] + (1 - cfg_si) * logits[1:] if n == 2 else logits).mul(1 / tau)
             idx_Bld = sample_with_top_k_top_p_also_inplace_modifying_logits_(
                 logits_BlV.reshape(1, -1, 2), rng=rng, top_k=args.top_k, top_p=args.top_p, num_samples=1)[:, :, 0]
             idx_Bld = idx_Bld.reshape(1, pn[1], pn[2], -1).unsqueeze(1)  # 1, 1, h, w, d

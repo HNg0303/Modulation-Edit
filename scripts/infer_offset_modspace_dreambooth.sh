@@ -3,10 +3,11 @@
 #   mod delta : gss_null + offset + lambda*(gss_prompt - gss_null), ca_kv = null    (prompt only in the AdaLN modulation space)
 #   ca prompt : gss_null + offset, ca_kv = T5(prompt)                               (prompt only through cross-attention)
 #   mod prompt: gss_prompt + offset with sos / head adaLN on the prompt too, ca_kv = null
+#   PROMPT_COND_SCALES=7-12: on those scales the edited rows use the prompt's cond_BD (gss + head adaLN) instead of null + offset
 #   mod delta + ca prompt, plus reference rows: offset only, pretrained prompt (no offset), train images
 # usage: bash scripts/infer_offset_modspace_dreambooth.sh [subject ...]      (default: every subject in RUN_DIR)
 #   env overrides: RUN_DIR=output/ada_offset/dreambooth_ls0-6 ITER=100 PROMPTS=dreambooth|'a {} in the snow|...' ({} = class)
-#                  DELTA_WEIGHTS=1 DELTA_SCALES=all OFFSET_SCALE=1 CFG=1[,2,3] TAU=1 NUM_SAMPLES=4 SEED=0
+#                  DELTA_WEIGHTS=1 DELTA_SCALES=all OFFSET_SCALE=1 PROMPT_COND_SCALES= CFG=1[,2,3] TAU=1 NUM_SAMPLES=4 SEED=0
 #                  VARIANTS=offset,mod_delta,mod_prompt,ca_prompt,combined,baseline SKIP_EXISTING=0 OUT_DIR=... PYTHON=...
 # output: ${OUT_DIR}/<subject>/<prompt>/{offset_,<variant>_cfg<c>_,baseline_}seedN.jpg, prompt.txt, grid.jpg
 #         score with: .venv/bin/python tools/eval_modspace.py ${OUT_DIR}
@@ -20,6 +21,7 @@ PROMPTS=${PROMPTS:-'a {} in the jungle|a {} in the snow|a {} on the beach|a {} w
 DELTA_WEIGHTS=${DELTA_WEIGHTS:-1}     # comma-separated lambdas, one row each
 DELTA_SCALES=${DELTA_SCALES:-all}     # scales where the modulation delta is added
 OFFSET_SCALE=${OFFSET_SCALE:-1}       # multiply the learned offset (0 = control: no offset)
+PROMPT_COND_SCALES=${PROMPT_COND_SCALES:-}   # e.g. 7-12: prompt cond_BD on those scales for the edited rows; empty = off
 CFG=${CFG:-1}                         # cfg (comma-separated: one row each) / tau of the prompt-injected rows; cfg partner = offset only row
 TAU=${TAU:-1}
 NUM_SAMPLES=${NUM_SAMPLES:-4}
@@ -44,7 +46,7 @@ $PYTHON tools/infer_offset_modspace.py \
     --use_scale_schedule_embedding 0 --apply_spatial_patchify 0 --checkpoint_type torch --bf16 1 \
     --text_channels 2048 --text_encoder_ckpt "$t5_path" --cfg "$CFG" --tau "$TAU" --seed "$SEED" \
     --run_dir "$RUN_DIR" --iter "$ITER" --subjects "$subjects" --prompts "$PROMPTS" \
-    --delta_weights "$DELTA_WEIGHTS" --delta_scales "$DELTA_SCALES" --offset_scale "$OFFSET_SCALE" \
+    --delta_weights "$DELTA_WEIGHTS" --delta_scales "$DELTA_SCALES" --offset_scale "$OFFSET_SCALE" --prompt_cond_scales "$PROMPT_COND_SCALES" \
     --num_samples "$NUM_SAMPLES" --variants "$VARIANTS" --skip_existing "$SKIP_EXISTING" --out_dir "$OUT_DIR" \
     2>&1 | tee -a "${OUT_DIR}/infer.log"
 echo "== done: ${OUT_DIR}"

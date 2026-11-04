@@ -209,7 +209,7 @@ def load_infinity(
 
         print(f'[Load Infinity weights]')
         if checkpoint_type == 'torch':
-            state_dict = torch.load(model_path, map_location=device)
+            state_dict = torch.load(model_path, map_location='cpu')  # cpu: the 8.8 GB fp32 checkpoint need not fit on the GPU next to the model
             print(infinity_test.load_state_dict(state_dict))
         elif checkpoint_type == 'torch_shard':
             from transformers.modeling_utils import load_sharded_checkpoint

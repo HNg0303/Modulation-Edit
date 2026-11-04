@@ -235,6 +235,7 @@ class Infinity(nn.Module):
         # optional learnable offset on the shared adaLN output (gamma1, gamma2, scale1, scale2, shift1, shift2); None = disabled, see enable_ada_offset
         self.register_parameter('ada_offset', None)
         self.ada_offset_cond_only = True
+        self.ada_base_scale = 1.0              # inference: where the offset is applied, the cond rows get ada_base_scale * G + offset
         self.ada_offset_infer_scales = None    # set of scale indices where autoregressive_infer_cfg applies the offset; None = all
 
         # fused norm
@@ -386,9 +387,10 @@ class Infinity(nn.Module):
             idx = torch.cat([torch.full((int(np.prod(pn)),), i, dtype=torch.long) for i, pn in enumerate(scale_schedule)])
             idx = F.pad(idx, (0, max(seq_len - idx.numel(), 0)), value=len(scale_schedule) - 1).to(offset.device)
             offset = offset[idx, 0].unsqueeze(0)    # 1, L, 6, C
+        base_scale = self.ada_base_scale if si is not None else 1.0  # teacher forcing always uses G + offset
         if B is not None and self.ada_offset_cond_only and cond_BD_or_gss.shape[0] > B:
-            return torch.cat((cond_BD_or_gss[:B] + offset, cond_BD_or_gss[B:].expand(-1, offset.shape[1], -1, -1)), dim=0)
-        return cond_BD_or_gss + offset
+            return torch.cat((base_scale * cond_BD_or_gss[:B] + offset, cond_BD_or_gss[B:].expand(-1, offset.shape[1], -1, -1)), dim=0)
+        return base_scale * cond_BD_or_gss + offset
 
     def get_logits(self, h: torch.Tensor, cond_BD: Optional[torch.Tensor]):
         """
